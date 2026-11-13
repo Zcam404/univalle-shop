@@ -13,6 +13,26 @@ cp .env.example .env
 sudo docker compose up -d --build
 ```
 
+### En Windows
+
+Instala **Docker Desktop** y déjalo abierto antes de empezar. Cambia el comando para copiar el `.env` y no se usa `sudo`:
+
+```powershell
+# PowerShell
+Copy-Item .env.example .env
+docker compose up -d --build
+```
+
+```cmd
+:: CMD (Símbolo del sistema)
+copy .env.example .env
+docker compose up -d --build
+```
+
+Para correr las pruebas sin Docker hace falta **Node.js**. En PowerShell: `cd services\users; npm install; npm test`.
+
+### Abrir la aplicación
+
 La primera vez tarda unos minutos mientras construye las imágenes. Luego abre:
 
 | Qué | Dirección |
