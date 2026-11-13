@@ -1,0 +1,241 @@
+# -----------------------------------------------------------------------------
+# Docker Compose de Univalle Shop.
+# Levanta todo el sistema con un solo comando: `docker compose up -d`.
+#
+# Cada microservicio tiene su PROPIA base de datos MongoDB (mongo-users,
+# mongo-catalog, ...). Las bases no publican puertos hacia la máquina
+# anfitriona: solo el servicio dueño de cada base puede alcanzarla dentro
+# de la red de Docker. Así se refuerza el desacoplamiento entre servicios.
+#
+# Los microservicios, el gateway y el frontend se irán agregando a este
+# archivo a medida que se implementen.
+# -----------------------------------------------------------------------------
+
+# Configuración común de las bases MongoDB, reutilizada con `<<: *mongo-base`
+# para no repetir la misma imagen, reinicio y healthcheck seis veces.
+x-mongo-base: &mongo-base
+  image: mongo:7.0
+  restart: unless-stopped
+  networks:
+    - backend
+  healthcheck:
+    # Comprueba que MongoDB responde antes de que arranque el servicio que la usa.
+    test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+services:
+  # --- Bases de datos: una por microservicio -------------------------------
+  mongo-users:
+    <<: *mongo-base
+    volumes:
+      - mongo-users-data:/data/db
+
+  mongo-catalog:
+    <<: *mongo-base
+    volumes:
+      - mongo-catalog-data:/data/db
+
+  mongo-orders:
+    <<: *mongo-base
+    volumes:
+      - mongo-orders-data:/data/db
+
+  mongo-payments:
+    <<: *mongo-base
+    volumes:
+      - mongo-payments-data:/data/db
+
+  mongo-search:
+    <<: *mongo-base
+    volumes:
+      - mongo-search-data:/data/db
+
+  mongo-recommendation:
+    <<: *mongo-base
+    volumes:
+      - mongo-recommendation-data:/data/db
+
+  # --- API Gateway -----------------------------------------------------------
+  # Único punto de entrada al backend (http://localhost:3000/api/...). Valida el
+  # JWT, aplica permisos por rol y enruta a cada microservicio. No depende de
+  # que los servicios estén arriba para arrancar: si uno está caído, solo sus
+  # rutas responden 503 (circuit breaker).
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    networks:
+      - backend
+    ports:
+      - "${GATEWAY_PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET}
+      UPSTREAM_TIMEOUT_MS: 5000
+      CIRCUIT_FAILURE_THRESHOLD: 5
+      CIRCUIT_RESET_TIMEOUT_MS: 30000
+      CORS_ORIGINS: http://localhost:${FRONTEND_PORT:-8080},http://localhost:5173
+      # Una variable <SERVICIO>_SERVICE_URL por microservicio.
+      USERS_SERVICE_URL: http://users:3001
+      CATALOG_SERVICE_URL: http://catalog:3002
+      ORDERS_SERVICE_URL: http://orders:3003
+      PAYMENTS_SERVICE_URL: http://payments:3004
+      SEARCH_SERVICE_URL: http://search:3005
+      RECOMMENDATION_SERVICE_URL: http://recommendation:3006
+
+  # --- Microservicios -------------------------------------------------------
+  # Servicio de Usuarios: registro con correo institucional, login (emite el
+  # JWT), perfil y direcciones. No publica puertos: solo se llega a él a través
+  # del API Gateway. Para probarlo directamente en desarrollo, descomenta
+  # `ports` y abre http://localhost:3001/docs.
+  users:
+    build: ./services/users
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      PORT: 3001
+      MONGO_URI: mongodb://mongo-users:27017/users
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN_SECONDS: ${JWT_EXPIRES_IN_SECONDS:-3600}
+      ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS}
+      VERIFICATION_CODE_TTL_MINUTES: 15
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      ADMIN_NAME: ${ADMIN_NAME:-Administrador Univalle Shop}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    depends_on:
+      mongo-users:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    # ports:
+    #   - "3001:3001"
+
+  # Servicio de Catálogo: productos, categorías, inventario y reservas de
+  # stock. Las rutas /internal/* las usan Pedidos y Búsqueda dentro de la red.
+  # Con SEED_DEMO_DATA=true carga productos de ejemplo si el catálogo está vacío.
+  catalog:
+    build: ./services/catalog
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      PORT: 3002
+      MONGO_URI: mongodb://mongo-catalog:27017/catalog
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+    depends_on:
+      mongo-catalog:
+        condition: service_healthy
+
+  # Servicio de Pedidos: carrito, compra e historial. Coordina la compra con
+  # Catálogo (reserva de stock) y Pagos (cobro), con timeout y circuit breaker.
+  orders:
+    build: ./services/orders
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      PORT: 3003
+      MONGO_URI: mongodb://mongo-orders:27017/orders
+      CATALOG_SERVICE_URL: http://catalog:3002
+      PAYMENTS_SERVICE_URL: http://payments:3004
+      REQUEST_TIMEOUT_MS: 4000
+      # Cada cuánto se revisan los cobros en duda (Pagos no respondió durante una compra).
+      RECONCILE_INTERVAL_MS: 20000
+    depends_on:
+      mongo-orders:
+        condition: service_healthy
+
+  # Servicio de Pagos: cobros con pasarela simulada (tarjetas de prueba), un
+  # pago por pedido y reembolsos. Solo guarda franquicia y últimos 4 dígitos.
+  payments:
+    build: ./services/payments
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      PORT: 3004
+      MONGO_URI: mongodb://mongo-payments:27017/payments
+      SIMULATED_LATENCY_MS: 150
+    depends_on:
+      mongo-payments:
+        condition: service_healthy
+
+  # Servicio de Búsqueda: índice propio de productos que se mantiene al día
+  # leyendo el feed de cambios de Catálogo; si Catálogo cae, sigue buscando
+  # con los últimos datos sincronizados.
+  search:
+    build: ./services/search
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      PORT: 3005
+      MONGO_URI: mongodb://mongo-search:27017/search
+      CATALOG_SERVICE_URL: http://catalog:3002
+      SYNC_INTERVAL_MS: 10000
+    depends_on:
+      mongo-search:
+        condition: service_healthy
+
+  # Servicio de Recomendación: sugiere productos según compras (Pedidos) y
+  # búsquedas (Búsqueda) del usuario. Guarda una copia del catálogo y la última
+  # versión de las señales, así sigue recomendando si alguno de ellos cae.
+  recommendation:
+    build: ./services/recommendation
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      PORT: 3006
+      MONGO_URI: mongodb://mongo-recommendation:27017/recommendation
+      CATALOG_SERVICE_URL: http://catalog:3002
+      ORDERS_SERVICE_URL: http://orders:3003
+      SEARCH_SERVICE_URL: http://search:3005
+      SYNC_INTERVAL_MS: 15000
+      SIGNALS_TIMEOUT_MS: 1500
+    depends_on:
+      mongo-recommendation:
+        condition: service_healthy
+
+  # --- Frontend ---------------------------------------------------------------
+  # Aplicación React servida por Nginx en http://localhost:8080. Nginx reenvía
+  # /api al gateway, así el navegador usa un solo origen.
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    networks:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      gateway:
+        condition: service_started
+
+  # --- Utilidades de desarrollo --------------------------------------------
+  # MailHog recibe los correos de verificación que envía el servicio de
+  # Usuarios (SMTP en el puerto 1025) y los muestra en una interfaz web.
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    restart: unless-stopped
+    networks:
+      - backend
+    ports:
+      - "${MAILHOG_UI_PORT:-8025}:8025"
+
+# Red interna compartida por los servicios, el gateway y las bases.
+networks:
+  backend:
+
+# Volúmenes con nombre para que los datos sobrevivan a `docker compose down`.
+volumes:
+  mongo-users-data:
+  mongo-catalog-data:
+  mongo-orders-data:
+  mongo-payments-data:
+  mongo-search-data:
+  mongo-recommendation-data:

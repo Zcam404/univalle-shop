@@ -1,0 +1,19 @@
+# Dependencias
+node_modules/
+
+# Compilados y reportes
+dist/
+build/
+coverage/
+
+# Variables de entorno locales (nunca se suben; usar .env.example como plantilla)
+.env
+
+# Editor y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+*.log
+
+# Backlog de Jira (solo local)
+docs/jira/
