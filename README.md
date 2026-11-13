@@ -10,7 +10,7 @@ Requisitos: Docker con Docker Compose.
 
 ```bash
 cp .env.example .env
-docker compose up -d --build
+sudo docker compose up -d --build
 ```
 
 La primera vez tarda unos minutos mientras construye las imágenes. Luego abre:
